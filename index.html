@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Load profile</title>
+<style>
+  :root { --bg:#fafaf8; --panel:#fff; --ink:#1c1c1a; --muted:#6b6b66; --line:#deddd6; --bar:#3b6fb6; --bar-cut:#c9ccd3; --accent:#d1612a; --p95:#7a4fb0; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#161616; --panel:#1f1f1e; --ink:#ececea; --muted:#9a9a94; --line:#33332f; --bar:#6a9be0; --bar-cut:#45474d; --accent:#ef8a58; --p95:#a98ae0; } }
+  * { box-sizing:border-box }
+  body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.45 system-ui,sans-serif; padding:16px; max-width:1100px; margin-inline:auto }
+  h1 { font-size:18px; margin:0 0 12px } h2 { font-size:14px; margin:0 0 8px }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px; margin-bottom:14px }
+  .controls { display:grid; grid-template-columns:repeat(auto-fill,minmax(170px,1fr)); gap:10px 14px }
+  label { display:flex; flex-direction:column; font-size:12px; color:var(--muted); gap:3px }
+  input,select { font:inherit; color:var(--ink); background:var(--bg); border:1px solid var(--line); border-radius:5px; padding:5px 6px; min-height:30px }
+  .cards { display:grid; grid-template-columns:repeat(auto-fill,minmax(120px,1fr)); gap:10px }
+  .card b { display:block; font-size:20px } .card span { font-size:12px; color:var(--muted) }
+  table { border-collapse:collapse; width:100% } td,th { text-align:right; padding:4px 8px; border-bottom:1px solid var(--line) } th:first-child,td:first-child { text-align:left }
+  th { font-weight:500; color:var(--muted); font-size:12px }
+  svg { width:100%; height:auto; display:block } svg text { fill:var(--muted); font-size:11px }
+  .note { color:var(--muted); font-size:12px; margin-top:6px }
+  @media (max-width:720px) { body { padding:12px 16px } }
+</style>
+</head>
+<body>
+<h1>Load profile — <span id="ent"></span></h1>
+<div class="panel"><div class="controls" id="controls"></div><div class="note" id="info"></div></div>
+<div class="panel"><div class="cards" id="cards"></div></div>
+<div class="panel"><h2>Distribution of demand</h2><div id="hist"></div>
+  <div class="note">Bars: share of time at each power level. Line: cumulative share (what an inverter of that size would cover). Grey bars are above the cut-off and excluded.</div></div>
+<div class="panel"><h2>Inverter size vs. coverage</h2><div id="cover"></div></div>
+<div class="panel"><h2>By hour of day</h2><div id="hours"></div>
+  <div class="note">Line: mean. Band: 5th–95th percentile. Dots: maximum (within the date range and cut-off).</div></div>
+<script src="data.js"></script>
+<script>
+const D = window.DATA;
+if (!D) document.body.innerHTML = '<p>data.js not found — run <code>node fetch.mjs</code> first.</p>';
+const $ = (id) => document.getElementById(id);
+document.getElementById('ent').textContent = D.entity;
+
+const res5 = D.series['5minute'] ?? [], resH = D.series['hour'] ?? [];
+const dayStr = (ms) => { const d = new Date(ms); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`; };
+const allMs = resH.map((r) => r[0]);
+const first = dayStr(Math.min(...allMs)), last = dayStr(Math.max(...allMs));
+
+// --- controls -------------------------------------------------------------
+const fields = [
+  ['res', 'Resolution', `<select><option value="5minute">5 min (last ~10 days)</option><option value="hour">Hourly (whole range)</option></select>`, 'hour'],
+  ['basis', 'Value', `<select><option value="1">Mean of bucket</option><option value="3">Max of bucket (peaks)</option></select>`, '1'],
+  ['from', 'From date', `<input type="date" min="${first}" max="${last}">`, first],
+  ['to', 'To date', `<input type="date" min="${first}" max="${last}">`, last],
+  ['h0', 'Hour of day from', `<input type="number" min="0" max="24" step="1">`, '0'],
+  ['h1', 'Hour of day to', `<input type="number" min="0" max="24" step="1">`, '24'],
+  ['days', 'Days', `<select><option value="all">All</option><option value="wd">Weekdays</option><option value="we">Weekends</option></select>`, 'all'],
+  ['sign', 'Sign', `<select><option value="auto">Auto-detect</option><option value="-1">Negative = demand</option><option value="1">Positive = demand</option></select>`, 'auto'],
+  ['cut', 'Cut-off, W (ignore above)', `<input type="number" min="0" step="100">`, '5000'],
+  ['bin', 'Bin width, W', `<input type="number" min="50" step="50">`, '250'],
+];
+$('controls').innerHTML = fields.map(([id, name, el]) => `<label>${name}${el.replace('>', ` id="${id}">`)}</label>`).join('');
+const saved = (() => { try { return JSON.parse(localStorage.getItem('ha-energy') ?? '{}'); } catch { return {}; } })();
+for (const [id, , , def] of fields) $(id).value = saved[id] ?? def;
+// Saved dates from a previous data.js may lie outside a freshly fetched range.
+for (const id of ['from', 'to']) if (!($(id).value >= first && $(id).value <= last)) $(id).value = id === 'from' ? first : last;
+// 5-minute data only exists for a short tail; start on it if the hourly range is long.
+if (!res5.length) $('res').querySelector('[value="5minute"]').disabled = true;
+
+// --- maths ----------------------------------------------------------------
+const pct = (sorted, p) => sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(p / 100 * sorted.length))] : NaN;
+const fmtW = (w) => isNaN(w) ? '–' : w >= 1000 ? (w / 1000).toFixed(2) + ' kW' : Math.round(w) + ' W';
+const median = (a) => { const s = [...a].sort((x, y) => x - y); return pct(s, 50); };
+
+function detectSign(rows, col) {
+  // Night load (00–05) is always real consumption, so whichever sign dominates there is "demand".
+  const night = rows.filter((r) => new Date(r[0]).getHours() < 5).map((r) => r[col]);
+  return median(night) < 0 ? -1 : 1;
+}
+
+function update() {
+  const s = Object.fromEntries(fields.map(([id]) => [id, $(id).value]));
+  try { localStorage.setItem('ha-energy', JSON.stringify(s)); } catch {}
+  const rows = s.res === '5minute' ? res5 : resH;
+  const col = Number(s.basis), bucketH = s.res === '5minute' ? 5 / 60 : 1;
+  const sign = s.sign === 'auto' ? detectSign(rows, col) : Number(s.sign);
+  const h0 = Number(s.h0), h1 = Number(s.h1), cut = Number(s.cut), bin = Math.max(50, Number(s.bin));
+  const t0 = new Date(s.from + 'T00:00:00').getTime(), t1 = new Date(s.to + 'T00:00:00').getTime() + 864e5;
+
+  const kept = [], over = [];
+  let export_ = 0;
+  for (const r of rows) {
+    if (r[0] < t0 || r[0] >= t1) continue;
+    const d = new Date(r[0]), h = d.getHours() + d.getMinutes() / 60, dow = d.getDay();
+    // h0 > h1 wraps midnight, e.g. 17 → 7 for the evening/night battery window.
+    const inHours = h0 <= h1 ? h >= h0 && h < h1 : h >= h0 || h < h1;
+    if (!inHours) continue;
+    if (s.days === 'wd' && (dow === 0 || dow === 6)) continue;
+    if (s.days === 'we' && dow >= 1 && dow <= 5) continue;
+    const v = sign * r[col];
+    if (v <= 0) { export_++; continue; }       // exporting, not demand
+    (v > cut ? over : kept).push({ v, h: Math.floor(h), t: r[0], mx: sign * r[3] });
+  }
+  const vals = kept.map((k) => k.v).sort((a, b) => a - b);
+  const n = vals.length;
+  const sum = vals.reduce((a, b) => a + b, 0);
+
+  $('info').textContent = `${rows.length} ${s.res === '5minute' ? '5-minute' : 'hourly'} buckets loaded · sign: ${sign < 0 ? 'negative = demand' : 'positive = demand'} · ` +
+    `${n} used, ${over.length} above cut-off, ${export_} export/zero skipped`;
+
+  const cards = [
+    ['Samples', n], ['Mean', fmtW(sum / n)], ['Median', fmtW(pct(vals, 50))], ['p90', fmtW(pct(vals, 90))],
+    ['p95', fmtW(pct(vals, 95))], ['p99', fmtW(pct(vals, 99))], ['p99.9', fmtW(pct(vals, 99.9))], ['Max', fmtW(vals[n - 1])],
+    ['Energy', (sum * bucketH / 1000).toFixed(1) + ' kWh'], ['Excluded', over.length ? (sign * 0 + over.length) + ' above ' + fmtW(cut) : 'none'],
+  ];
+  $('cards').innerHTML = cards.map(([k, v]) => `<div class="card"><b>${v}</b><span>${k}</span></div>`).join('');
+
+  drawHist(vals, over.map((o) => o.v), bin, cut);
+  drawCover(vals, sum);
+  drawHours(kept);
+}
+
+// --- charts ---------------------------------------------------------------
+const W = 860, H = 280, P = { l: 44, r: 44, t: 10, b: 30 };
+
+function drawHist(vals, overVals, bin, cut) {
+  const maxV = Math.max(vals[vals.length - 1] ?? 0, ...overVals, bin), nb = Math.ceil(maxV / bin) + 1;
+  const counts = new Array(nb).fill(0), cutCounts = new Array(nb).fill(0);
+  for (const v of vals) counts[Math.floor(v / bin)]++;
+  for (const v of overVals) cutCounts[Math.floor(v / bin)]++;
+  const total = vals.length + overVals.length || 1, peak = Math.max(...counts, ...cutCounts) / total || 1;
+  const bw = (W - P.l - P.r) / nb, y = (f) => H - P.b - f * (H - P.t - P.b);
+  let acc = 0, svg = '', line = '';
+  for (let i = 0; i < nb; i++) {
+    const x = P.l + i * bw;
+    const f = counts[i] / total / peak, fc = cutCounts[i] / total / peak;
+    svg += `<rect x="${x + 0.5}" y="${y(f)}" width="${Math.max(bw - 1, 1)}" height="${H - P.b - y(f)}" fill="var(--bar)"><title>${i * bin}–${(i + 1) * bin} W: ${(counts[i] / total * 100).toFixed(1)}%</title></rect>`;
+    if (cutCounts[i]) svg += `<rect x="${x + 0.5}" y="${y(fc)}" width="${Math.max(bw - 1, 1)}" height="${H - P.b - y(fc)}" fill="var(--bar-cut)"/>`;
+    acc += counts[i];
+    line += `${i ? 'L' : 'M'}${(x + bw).toFixed(1)},${y(acc / (vals.length || 1)).toFixed(1)}`;
+  }
+  const step = Math.max(1, Math.round(nb / 12));
+  for (let i = 0; i <= nb; i += step) svg += `<text x="${P.l + i * bw}" y="${H - 12}" text-anchor="middle">${(i * bin / 1000).toFixed(i * bin % 1000 ? 2 : 0)}k</text>`;
+  svg += `<path d="${line}" fill="none" stroke="var(--accent)" stroke-width="2"/>`;
+  for (const f of [0, .5, 1]) svg += `<text x="${W - P.r + 6}" y="${y(f) + 4}">${f * 100}%</text><line x1="${P.l}" x2="${W - P.r}" y1="${y(f)}" y2="${y(f)}" stroke="var(--line)"/>`;
+  $('hist').innerHTML = `<svg viewBox="0 0 ${W} ${H}">${svg}</svg>`;
+}
+
+function drawCover(vals, sum) {
+  const sizes = [2000, 3000, 3680, 5000, 6000, 8000, 10000, 12000];
+  const rows = sizes.map((kw) => {
+    const within = vals.filter((v) => v <= kw).length / (vals.length || 1);
+    const energy = vals.reduce((a, v) => a + Math.min(v, kw), 0) / (sum || 1);
+    return `<tr><td>${kw / 1000} kW</td><td>${(within * 100).toFixed(2)}%</td><td>${(energy * 100).toFixed(2)}%</td><td>${vals.length - Math.round(within * vals.length)}</td></tr>`;
+  });
+  $('cover').innerHTML = `<table><tr><th>Inverter</th><th>Time fully covered</th><th>Energy covered</th><th>Samples above</th></tr>${rows.join('')}</table>`;
+}
+
+function drawHours(kept) {
+  const by = Array.from({ length: 24 }, () => []);
+  for (const k of kept) by[k.h].push(k.v);
+  const stats = by.map((a) => { a.sort((x, y) => x - y); return a.length ? { mean: a.reduce((x, y) => x + y, 0) / a.length, lo: pct(a, 5), hi: pct(a, 95), max: a[a.length - 1] } : null; });
+  const top = Math.max(...stats.filter(Boolean).map((s) => s.max), 1000);
+  const bw = (W - P.l - P.r) / 24, y = (v) => H - P.b - v / top * (H - P.t - P.b), x = (h) => P.l + (h + .5) * bw;
+  let svg = '', band = '', mean = '';
+  const ok = stats.map((s, h) => s && [h, s]).filter(Boolean);
+  band = ok.map(([h, s]) => `${x(h)},${y(s.hi)}`).join(' ') + ' ' + [...ok].reverse().map(([h, s]) => `${x(h)},${y(s.lo)}`).join(' ');
+  mean = ok.map(([h, s], i) => `${i ? 'L' : 'M'}${x(h)},${y(s.mean)}`).join('');
+  svg += `<polygon points="${band}" fill="var(--p95)" opacity=".2"/><path d="${mean}" fill="none" stroke="var(--p95)" stroke-width="2"/>`;
+  for (const [h, s] of ok) svg += `<circle cx="${x(h)}" cy="${y(s.max)}" r="2.5" fill="var(--accent)"><title>${h}:00 max ${fmtW(s.max)}</title></circle>`;
+  for (let h = 0; h < 24; h += 2) svg += `<text x="${x(h)}" y="${H - 12}" text-anchor="middle">${h}</text>`;
+  for (let i = 0; i <= 4; i++) { const v = top * i / 4; svg += `<text x="${P.l - 6}" y="${y(v) + 4}" text-anchor="end">${(v / 1000).toFixed(1)}k</text><line x1="${P.l}" x2="${W - P.r}" y1="${y(v)}" y2="${y(v)}" stroke="var(--line)"/>`; }
+  $('hours').innerHTML = `<svg viewBox="0 0 ${W} ${H}">${svg}</svg>`;
+}
+
+document.querySelectorAll('#controls input, #controls select').forEach((el) => el.addEventListener('input', update));
+update();
+</script>
+</body>
+</html>
