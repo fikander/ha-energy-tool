@@ -9,6 +9,8 @@ Two parts, no dependencies beyond Node 24 (for `process.loadEnvFile` and the bui
 - `fetch.mjs` pulls long-term statistics from Home Assistant and writes `data.js`.
 - `index.html` is a local page that reads `data.js`. Open it straight from disk; nothing is sent anywhere.
 
+![Example: load profile page showing the controls, percentiles, demand histogram, inverter coverage table and hour-of-day profile](example.png)
+
 ## Setup
 
 Create `.env` beside `fetch.mjs`:
