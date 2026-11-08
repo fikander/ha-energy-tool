@@ -32,6 +32,10 @@
 <div class="panel"><h2>Inverter size vs. coverage</h2><div id="cover"></div></div>
 <div class="panel"><h2>By hour of day</h2><div id="hours"></div>
   <div class="note">Line: mean. Band: 5th–95th percentile. Dots: maximum (within the date range and cut-off).</div></div>
+<div class="panel"><h2>Daily energy use (24 h)</h2><div class="cards" id="dcards"></div><div id="dhist"></div>
+  <div class="note" id="dnote"></div></div>
+<div class="panel"><h2>Battery size vs. days covered</h2><div id="dcover"></div>
+  <div class="note">Share of days whose whole 24 h consumption fits in a battery of this usable capacity, i.e. a full battery would last the day with no recharge from PV or grid. For several bad days in a row, check the longest run in the table.</div></div>
 <script src="data.js"></script>
 <script>
 const D = window.DATA;
@@ -56,6 +60,7 @@ const fields = [
   ['sign', 'Sign', `<select><option value="auto">Auto-detect</option><option value="-1">Negative = demand</option><option value="1">Positive = demand</option></select>`, 'auto'],
   ['cut', 'Cut-off, W (ignore above)', `<input type="number" min="0" step="100">`, '5000'],
   ['bin', 'Bin width, W', `<input type="number" min="50" step="50">`, '250'],
+  ['dbin', 'Daily bin width, kWh', `<input type="number" min="1" step="1">`, '5'],
 ];
 $('controls').innerHTML = fields.map(([id, name, el]) => `<label>${name}${el.replace('>', ` id="${id}">`)}</label>`).join('');
 const saved = (() => { try { return JSON.parse(localStorage.getItem('ha-energy') ?? '{}'); } catch { return {}; } })();
@@ -116,6 +121,34 @@ function update() {
   drawHist(vals, over.map((o) => o.v), bin, cut);
   drawCover(vals, sum);
   drawHours(kept);
+  drawDaily(dailyTotals(s, t0, t1, cut), Math.max(1, Number(s.dbin)), cut);
+}
+
+// Daily energy. Always built from hourly means (mean W x 1 h = Wh, exact), over whole local
+// days: the hour-of-day window and resolution/value settings do not apply. Date range, weekday
+// filter, sign and cut-off do. Days with missing hours are dropped, not counted as low usage.
+function dailyTotals(s, t0, t1, cut) {
+  const sign = s.sign === 'auto' ? detectSign(resH, 1) : Number(s.sign);
+  const by = new Map();
+  for (const r of resH) {
+    if (r[0] < t0 || r[0] >= t1) continue;
+    const k = dayStr(r[0]);
+    const d = by.get(k) ?? { day: k, ms: r[0], n: 0, wh: 0, cut: 0 };
+    d.n++;
+    const v = sign * r[1];
+    if (v > cut) d.cut++; else if (v > 0) d.wh += v;
+    by.set(k, d);
+  }
+  const out = { days: [], incomplete: 0 };
+  for (const d of by.values()) {
+    const dow = new Date(d.ms).getDay();
+    if (s.days === 'wd' && (dow === 0 || dow === 6)) continue;
+    if (s.days === 'we' && dow >= 1 && dow <= 5) continue;
+    if (d.n < 23 || d.n > 25) { out.incomplete++; continue; }   // 23/25 h = DST changeover
+    out.days.push({ day: d.day, kwh: d.wh / 1000, cut: d.cut });
+  }
+  out.days.sort((a, b) => a.day < b.day ? -1 : 1);
+  return out;
 }
 
 // --- charts ---------------------------------------------------------------
@@ -169,6 +202,52 @@ function drawHours(kept) {
   for (let h = 0; h < 24; h += 2) svg += `<text x="${x(h)}" y="${H - 12}" text-anchor="middle">${h}</text>`;
   for (let i = 0; i <= 4; i++) { const v = top * i / 4; svg += `<text x="${P.l - 6}" y="${y(v) + 4}" text-anchor="end">${(v / 1000).toFixed(1)}k</text><line x1="${P.l}" x2="${W - P.r}" y1="${y(v)}" y2="${y(v)}" stroke="var(--line)"/>`; }
   $('hours').innerHTML = `<svg viewBox="0 0 ${W} ${H}">${svg}</svg>`;
+}
+
+function drawDaily({ days, incomplete }, bin, cut) {
+  const vals = days.map((d) => d.kwh).sort((a, b) => a - b), n = vals.length;
+  const fmtK = (v) => isNaN(v) ? '–' : v.toFixed(1) + ' kWh';
+  const cutDays = days.filter((d) => d.cut).length;
+  $('dcards').innerHTML = [
+    ['Days', n], ['Mean', fmtK(vals.reduce((a, b) => a + b, 0) / n)], ['Median', fmtK(pct(vals, 50))],
+    ['p90', fmtK(pct(vals, 90))], ['p95', fmtK(pct(vals, 95))], ['Max', fmtK(vals[n - 1])],
+  ].map(([k, v]) => `<div class="card"><b>${v}</b><span>${k}</span></div>`).join('');
+  $('dnote').textContent = `Bars: number of days at each daily total. Line: cumulative share of days. ` +
+    `${incomplete} day(s) with missing hours skipped` + (cutDays ? `; ${cutDays} day(s) include hours above the ${fmtW(cut)} cut-off, which are left out of their total` : '') +
+    `. Uses hourly means over whole days; the hour-of-day window does not apply.`;
+  if (!n) { $('dhist').innerHTML = ''; $('dcover').innerHTML = ''; return; }
+
+  const nb = Math.ceil(vals[n - 1] / bin) + 1, counts = new Array(nb).fill(0);
+  for (const v of vals) counts[Math.floor(v / bin)]++;
+  const peak = Math.max(...counts), bw = (W - P.l - P.r) / nb, y = (f) => H - P.b - f * (H - P.t - P.b);
+  let svg = '', line = '', acc = 0;
+  for (let i = 0; i < nb; i++) {
+    const x = P.l + i * bw, f = counts[i] / peak;
+    svg += `<rect x="${x + 0.5}" y="${y(f)}" width="${Math.max(bw - 1, 1)}" height="${H - P.b - y(f)}" fill="var(--bar)"><title>${i * bin}–${(i + 1) * bin} kWh: ${counts[i]} day(s)</title></rect>`;
+    acc += counts[i];
+    line += `${i ? 'L' : 'M'}${(x + bw).toFixed(1)},${y(acc / n).toFixed(1)}`;
+  }
+  const step = Math.max(1, Math.round(nb / 12));
+  for (let i = 0; i <= nb; i += step) svg += `<text x="${P.l + i * bw}" y="${H - 12}" text-anchor="middle">${i * bin}</text>`;
+  svg += `<path d="${line}" fill="none" stroke="var(--accent)" stroke-width="2"/>`;
+  for (const f of [0, .5, 1]) svg += `<text x="${W - P.r + 6}" y="${y(f) + 4}">${f * 100}%</text><line x1="${P.l}" x2="${W - P.r}" y1="${y(f)}" y2="${y(f)}" stroke="var(--line)"/>`;
+  svg += `<text x="${P.l}" y="${P.t + 4}" text-anchor="start">peak ${peak} day(s)</text>`;
+  $('dhist').innerHTML = `<svg viewBox="0 0 ${W} ${H}">${svg}</svg>`;
+
+  // Longest run of consecutive calendar days above each capacity: a battery that covers 90% of
+  // days still fails if the bad 10% come in a row.
+  const dayNum = (d) => Math.round(new Date(d + 'T12:00:00').getTime() / 864e5);
+  const rows = [5, 10, 15, 20, 25, 30, 40, 50, 60].map((kwh) => {
+    const ok = vals.filter((v) => v <= kwh).length;
+    let run = 0, best = 0, prev = null;
+    for (const d of days) {
+      run = d.kwh > kwh ? (prev !== null && dayNum(d.day) === prev + 1 ? run + 1 : 1) : 0;
+      prev = d.kwh > kwh ? dayNum(d.day) : null;
+      best = Math.max(best, run);
+    }
+    return `<tr><td>${kwh} kWh</td><td>${(ok / n * 100).toFixed(1)}%</td><td>${n - ok}</td><td>${best}</td></tr>`;
+  });
+  $('dcover').innerHTML = `<table><tr><th>Usable capacity</th><th>Days fully covered</th><th>Days not covered</th><th>Longest run not covered, days</th></tr>${rows.join('')}</table>`;
 }
 
 document.querySelectorAll('#controls input, #controls select').forEach((el) => el.addEventListener('input', update));

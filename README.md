@@ -26,7 +26,7 @@ Variables already set in the shell win over the file. Keep `.env` out of any rep
 ## Fetching data
 
 ```bash
-node fetch.mjs [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--days N] [--entity sensor.x]
+node fetch.mjs [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--days N] [--entity sensor.x] [--minus sensor.y]
 ```
 
 | Flags | Window |
@@ -48,7 +48,40 @@ node fetch.mjs --from 2025-11-01 --to 2025-11-30    # same month last year
 node fetch.mjs --to 2025-11-30 --days 30            # same thing
 ```
 
+`--minus` subtracts a second power sensor bucket by bucket, to get a load that has no sensor of its own.
+The M1 meter only sees the grid, so true house load is PV production minus the (negative-when-importing)
+meter. Both sensors are requested in W, because the inverter's `AC Power` is in kW and the meter's in W:
+
+```bash
+node fetch.mjs --entity sensor.solaredge_ac_power --minus sensor.solaredge_m1_ac_power --from 2025-11-08 --to 2026-03-31
+```
+
+Means subtract exactly; a bucket's min and max cannot, so they become bounds (max = a.max − b.min) and
+*Max of bucket* overstates peaks. For data from 2026-11-08 onward there is a ready-made sensor, see
+[House load sensor](#house-load-sensor); past winters need `--minus`.
+
 Each run overwrites `data.js`. Copy it aside if you want to keep one window while fetching another.
+
+### House load sensor
+
+A Home Assistant Template Helper, **`sensor.house_power`** ("House Power"), was created on **2026-11-08**.
+It is true house load in W: PV production + grid import − grid export.
+
+```
+{{ states('sensor.solaredge_ac_power') | float * 1000 - states('sensor.solaredge_m1_ac_power') | float }}
+```
+
+(`solaredge_ac_power` is in kW, the M1 meter in W, hence the `* 1000`.) It has device class power and state
+class measurement, so HA keeps hourly mean/min/max statistics for it. Because it is a real sensor, its min
+and max are exact, unlike `--minus`. It records only from 2026-11-08, so the 2026/27 winter and later can
+be fetched directly, with no `--minus`:
+
+```bash
+node fetch.mjs --entity sensor.house_power --from 2026-11-08 --to 2027-03-31
+```
+
+Edit it under Settings → Devices & Services → Helpers. If it goes missing, recreate it with the template
+above. Before 2026-11-08, use `--minus` instead.
 
 ### Resolution
 
@@ -80,6 +113,13 @@ Settings are remembered in the browser. The page shows:
 - **Histogram** — share of time at each power level, with a cumulative line.
 - **Inverter size vs. coverage** — for 2–12 kW: share of time fully covered and share of energy covered.
 - **By hour of day** — mean, 5th–95th percentile band and maximum per hour.
+- **Daily energy use (24 h)** — histogram of kWh per day with a cumulative line, plus mean/median/p90/p95/max.
+  For sizing storage over winter. Built from hourly means over whole local days, so the resolution,
+  value and hour-of-day settings do not apply; date range, weekdays/weekends, sign and cut-off do.
+  Days with missing hours are skipped and reported. *Daily bin width* sets the bar size.
+- **Battery size vs. days covered** — for 5–60 kWh usable: share of days that fit, how many do not,
+  and the longest run of consecutive days that do not (a battery that covers 90% of days still fails
+  if the bad days come in a row).
 
 ## Reading the results
 
@@ -90,4 +130,7 @@ Settings are remembered in the browser. The page shows:
 - A car charge shows up as its own bump in the histogram. Put the cut-off in the gap between it and
   normal load. In 5-minute data a charge's first and last buckets can be partial and slip under the
   cut-off; the effect is small.
+- The cut-off applies to the daily totals too: hours above it are left out of that day. That removes
+  car charging, but would also drop a heat-pump hour above the cut-off, so raise it (or set it very
+  high) when sizing for heating, and check the note under the daily chart for how many days are affected.
 - This is a statement about past load, not a recommendation for a particular product.

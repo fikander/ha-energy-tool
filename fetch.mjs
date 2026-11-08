@@ -2,7 +2,7 @@
 // websocket API and writes data.js, which index.html loads with a plain <script>
 // (file:// pages cannot fetch() a sibling JSON file).
 //
-//   node fetch.mjs [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--days N] [--entity sensor.x]
+//   node fetch.mjs [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--days N] [--entity sensor.x] [--minus sensor.y]
 //
 // How the window is worked out (--to is inclusive of that whole day):
 //   --days N              the N days up to now             (default 35)
@@ -10,6 +10,12 @@
 //   --from D --days N     N days forward from D
 //   --to D --days N      N days back from the end of D
 //   --from D --to D       exactly that
+// --minus subtracts a second power sensor bucket by bucket (entity - minus), for a load that
+// has no sensor of its own but can be derived, e.g. house load = PV production - grid meter:
+//   --entity sensor.solaredge_ac_power --minus sensor.solaredge_m1_ac_power
+// Power is requested in W whatever unit each sensor uses. Means subtract exactly. Min and max cannot: they are bounds (max = a.max - b.min, min = a.min -
+// b.max), so a derived "max of bucket" overstates the real peak. Buckets missing in either sensor
+// are dropped.
 // Credentials come from .env beside this script (HA_TOKEN, optional HA_URL).
 //
 // Two resolutions are kept because they have different retention: the recorder
@@ -33,9 +39,12 @@ const { values: args, positionals } = parseArgs({
     to: { type: 'string' },
     days: { type: 'string' },
     entity: { type: 'string' },
+    minus: { type: 'string' },
   },
 });
 const entity = args.entity ?? positionals[0] ?? 'sensor.solaredge_m1_ac_power';
+const minus = args.minus;
+const label = minus ? `${entity} - ${minus}` : entity;
 
 const DAY = 864e5;
 const fail = (msg) => { console.error(msg); process.exit(1); };
@@ -102,22 +111,32 @@ ws.onerror = () => { console.error(`Cannot reach ${HA_URL}`); process.exit(1); }
 
 async function run() {
   const { start, end } = window();
-  console.log(`${entity}: ${start.toLocaleString()} → ${end.toLocaleString()}`);
-  const out = { entity, fetchedAt: new Date().toISOString(), series: {} };
+  console.log(`${label}: ${start.toLocaleString()} → ${end.toLocaleString()}`);
+  const out = { entity: label, fetchedAt: new Date().toISOString(), series: {} };
   for (const period of ['5minute', 'hour']) {
     const res = await call({
       type: 'recorder/statistics_during_period',
       start_time: start.toISOString(),
       end_time: end.toISOString(),
-      statistic_ids: [entity],
+      statistic_ids: minus ? [entity, minus] : [entity],
+      // Ask HA to convert, so a kW sensor minus a W sensor (the SolarEdge inverter vs its meter) works.
+      units: { power: 'W' },
       period,
       types: ['mean', 'min', 'max'],
     });
     // Compact rows: [startMs, mean, min, max]. Gaps (null) are dropped.
-    out.series[period] = (res[entity] ?? [])
-      .filter((r) => r.mean != null)
-      .map((r) => [r.start, r.mean, r.min, r.max]);
-    console.log(`${period}: ${out.series[period].length} buckets`);
+    const rows = (id) => (res[id] ?? []).filter((r) => r.mean != null);
+    if (!minus) {
+      out.series[period] = rows(entity).map((r) => [r.start, r.mean, r.min, r.max]);
+      console.log(`${period}: ${out.series[period].length} buckets`);
+      continue;
+    }
+    const [a, b] = [rows(entity), rows(minus)];
+    const bByStart = new Map(b.map((r) => [r.start, r]));
+    out.series[period] = a
+      .filter((r) => bByStart.has(r.start))
+      .map((r) => { const q = bByStart.get(r.start); return [r.start, r.mean - q.mean, r.min - q.max, r.max - q.min]; });
+    console.log(`${period}: ${out.series[period].length} buckets (${entity}: ${a.length}, ${minus}: ${b.length})`);
   }
   writeFileSync(join(dirname(fileURLToPath(import.meta.url)), 'data.js'), 'window.DATA = ' + JSON.stringify(out) + ';\n');
   console.log('wrote data.js');
